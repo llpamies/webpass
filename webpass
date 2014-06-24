@@ -1,0 +1,205 @@
+#!/bin/env python3
+
+import os
+import sys
+import json
+import getpass
+import requests
+import xml.dom.minidom
+
+from Crypto.Cipher.AES import AESCipher
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Random.random import randint
+
+from awsauth import S3Auth
+
+S3BucketID = ""
+UserPassword = ""
+AWSAccessKeyId = ""
+AWSSecretKey = ""
+S3URL = "https://%s.s3.amazonaws.com/"%(S3BucketID)
+
+class Register:
+    def __init__(self, webname, username, password, info=""):
+        self.webname = webname
+        self.username = username
+        self.password = password
+        self.info = info
+
+    def dump(self):
+        d = {}
+        d["username"] = self.username
+        d["password"] = self.password
+        d["info"] = self.info
+        return json.dumps(d)
+
+    @classmethod
+    def parse(cls, webname, s):
+        d = json.loads(s)
+        return cls(webname, d["username"], d["password"], d["info"])
+
+    def __repr__(self):
+        s = self.webname[:]
+        s += "\n  user: " + self.username
+        s += "\n  pass: " + self.password
+        s += "\n  info: " + self.info
+        return s
+
+class Store:
+    def __init__(self):
+        self.auth = S3Auth(AWSAccessKeyId, AWSSecretKey)
+
+    def put(self, k, v):
+        assert type(k) == str
+        assert type(v) == bytes
+        r = requests.put(S3URL + k, data=v, auth=self.auth)
+        if r.status_code != 200:
+            raise Exception("put failed")
+
+    def get(self, k):
+        assert type(k) == str
+        r = requests.get(S3URL + k, auth=self.auth)
+        if r.status_code != 200:
+            raise Exception("get failed")
+        assert type(r.content) == bytes
+        return r.content
+
+    def list(self):
+        r = requests.get(S3URL, auth=self.auth)
+        if r.status_code != 200:
+            raise Exception("get failed")
+        dom = xml.dom.minidom.parseString(r.text)
+        return [elem.firstChild.nodeValue \
+                  for elem in dom.getElementsByTagName("Key")]
+
+class Crypt:
+    SALT_LENGTH = 8
+    KEY_LENGTH  = 32
+
+    @staticmethod
+    def randbytes(n):
+        return bytes(randint(0,255) for i in range(n))
+
+    @classmethod
+    def encrypt_key(cls, plain_key, password):
+        assert type(plain_key) == bytes
+        assert len(plain_key) == cls.KEY_LENGTH
+        assert type(password) == str
+        salt = cls.randbytes(cls.SALT_LENGTH)
+        key = PBKDF2(password, salt, dkLen=cls.KEY_LENGTH, count=5000)
+        return salt + cls.__encrypt(plain_key, key)
+
+    @classmethod
+    def decrypt_key(cls, enc_key, password):
+        assert type(enc_key) == bytes
+        assert type(password) == str
+        salt = enc_key[:cls.SALT_LENGTH]
+        key = PBKDF2(password, salt, dkLen=cls.KEY_LENGTH, count=5000)
+        return cls.__decrypt(enc_key[cls.SALT_LENGTH:], key)
+
+    @classmethod
+    def __encrypt(cls, plain, key):
+        assert type(plain) == bytes
+        assert type(key) == bytes
+        length = len(plain)
+        mult = int((length+15)/16)*16
+        plain += ("0"*(mult-length)).encode() #plain length has to be multiple of 16
+        return ("%6d"%(length)).encode() + AESCipher(key).encrypt(plain)
+
+    @classmethod
+    def __decrypt(cls, enc, key):
+        assert type(enc) == bytes
+        assert type(key) == bytes
+        length = int(enc[:6])
+        return AESCipher(key).decrypt(enc[6:])[:length]
+
+    @classmethod
+    def encrypt(cls, plain, key):
+        return cls.__encrypt(plain.encode('UTF-8'), key)
+
+    @classmethod
+    def decrypt(cls, enc, key):
+        return cls.__decrypt(enc, key).decode('UTF-8')
+
+class Webpass:
+    SYSTEM_PASS = "__systempass__"
+    USER_PASS = "__userpass__"
+
+    def __init__(self):
+        self.store = Store()
+        if UserPassword:
+            userpass = UserPassword
+        else:
+            userpass = getpass.getpass("User password: ")
+        try:
+            self.key = Crypt.decrypt_key(self.store.get(self.SYSTEM_PASS), userpass)
+        except:
+            print("Error: System not initialized.")
+            raise
+        if Crypt.decrypt(self.store.get(self.USER_PASS), self.key) != userpass:
+            print("Error: Wrong user password.")
+            raise Exception()
+
+    def get(self, webname):
+        s = Crypt.decrypt(self.store.get(webname), self.key)
+        return Register.parse(webname, s)
+
+    def copy(self, webpass):
+        reg = self.get(webpass)
+        os.system("echo -n \"%s\" | xsel -bi"%(reg.password))
+
+    def put(self, r):
+        return self.store.put(r.webname, Crypt.encrypt(r.dump(), self.key))
+
+    @classmethod
+    def list(cls):
+        store = Store()
+        for item in store.list():
+            if item.startswith('__') and item.endswith('__'):
+                continue
+            print(item)
+
+    @classmethod
+    def setup(cls):
+        store = Store()
+        try:
+            store.get(cls.SYSTEM_PASS)
+            print("Error: System is already set up.")
+        except:
+            key = Crypt.randbytes(Crypt.KEY_LENGTH)
+            password = getpass.getpass("New user password: ")
+            if getpass.getpass("Repeat user password: ") != password:
+                print("Error: passwords don't match.")
+            else:
+                store.put(cls.SYSTEM_PASS, Crypt.encrypt_key(key, password))
+                store.put(cls.USER_PASS, Crypt.encrypt(password, key))
+
+def usage():
+    print("./webpass cmd [opt]\ncommands:\n\tget webname\n\tcopy webname\n\tnew\n\tsetup\n")
+
+if __name__ == "__main__":
+    if len(sys.argv)<2:
+        usage()
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "setup":
+        Webpass.setup()
+    elif command == "get":
+        webpass = Webpass()
+        print(webpass.get(sys.argv[2]))
+    elif command == "copy":
+        webpass = Webpass()
+        webpass.copy(sys.argv[2])
+    elif command == "new":
+        webpass = Webpass()
+        reg = Register(input("Webname: "),
+                        input("Username: "),
+                        input("Password: "),
+                        input("Info: "))
+        webpass.put(reg)
+    elif command == "ls":
+        Webpass.list()
+    else:
+        usage()
